@@ -1,43 +1,36 @@
 from __future__ import division
 import numpy as np
 import pandas as pd
-import summary_stats as ss
-import statsmodels.api as sm
-from patsy.contrasts import Treatment
-from patsy.contrasts import Poly
+from statsmodels.survey import summary_stats as ss
 
-# TODO: compute corrected statistics
-# add documentation
-# start testing
+
 class SurveyTable(object):
     # assumes data is nx2 ie the user specified which two
     # columns to work with
     def __init__(self, design, data):
         self.design = design
-        # i could also treat the levels of the two vars as nested
-        # ie put them in replacement for 'strata' and 'cluster' in surveydesign.
-        # the benefits is that it's easier to get the totals, SE, etc
-        # but it'll not be as intuitive to derive col_prop, cell_prop, etc
-        self._m, self._p =  data.shape
-        self.df = pd.concat([pd.DataFrame(data), pd.DataFrame(weights)], axis=1)
+        self._m, self._p = data.shape
+        self.df = pd.concat([pd.DataFrame(data),
+                            pd.DataFrame(self.design.weights)], axis=1)
 
         # if just given one column
         if self.df.shape[1] == 2:
             self.df.columns = ['var1', 'weights']
             self.df_group = self.df.groupby(['var1'])
-            self.table = self.df_group.weights.sum().unstack(fill_value=0)
+            self.table = self.df_group.weights.sum().unstack()
+            self.table = self.table.fillna(0)
         elif self.df.shape[1] == 3:
             self.df.columns = ["var1", "var2", "weights"]
             self.df_group = self.df.groupby(['var1', 'var2'])
-
             # the 'total' for each group
-            self.table = self.df_group.weights.sum().unstack(fill_value=0)
+            self.table = self.df_group.weights.sum().unstack()
+            self.table = self.table.fillna(0)
 
         else:
             return ValueError("data should only have 1 or 2 columns")
 
-        self._row_sum = self.table.sum(axis=1) # shape is (var1_unique_labs, )
-        self._col_sum = self.table.sum(axis=0) # shape is (var2_unique_labs, )
+        self._row_sum = self.table.sum(axis=1)  # shape is (var1_unique_labs, )
+        self._col_sum = self.table.sum(axis=0)  # shape is (var2_unique_labs, )
         self._row_prop = self.table.div(self._row_sum, axis=0)
         self._col_prop = self.table.div(self._col_sum, axis=1)
         self._tot_sum = self.table.sum().sum()
@@ -47,60 +40,149 @@ class SurveyTable(object):
         # estimated proportion under the null hypothesis of independence
         self._null = np.outer(self._row_marginal, self._col_marginal)
 
-
-
     def __str__(self):
-        tab = self._row_prop.copy()
-        tab['col_tot'] = tab.sum(axis=1)
+        tab = self._cell_prop.copy()
+        # tab['col_tot'] = tab.sum(axis=1)
         # tab.loc['row_tot'] = tab.sum(axis=0)
         print(tab)
-        return 'cell_proportions'
+        return 'key: cell_proportions'
 
-    def test_pearson(self):
+    def test_pearson(self, cell_prop=True):
         cell_diff_square = np.square((self._cell_prop - self._null))
         # uncorrected stat
         self.pearson = self._m * (cell_diff_square / self._null).sum().sum()
+        # rao and scott correction
+        self._delta(cell_prop)
+        if self._delta_est.ndim == 1:
+            self._trace = self.delta_est
+            self._trace_sq = np.square(self._delta_est)
+        else:
+            self._trace = np.trace(self._delta_est)
+            self._trace_sq = np.trace(np.square(self._delta_est))
 
-    def test_lrt(self):
+        self.pearson_chi = self.pearson * (self._trace / self._trace_sq)
+        self.dof_chi = np.square(self._trace) / self._trace_sq
+        self.pearson_f = self.pearson / self._trace
+        v = self.design.n_clust - self.design.n_strat
+        self.dof_F = (self.dof_chi, v * self.dof_chi)
+
+    def test_lrt(self, cell_prop=True):
         # Note: this is not definited if there are zeros in self.table
-        if 0 in self.table:
+        if self._cell_prop.isin([0]).sum().sum() == 1:
             raise ValueError("table should not contain 0 for test_lrt")
         # uncorrected stat
-        self.lrt = (self._col_prop * np.log(self._col_prop / self._null)).sum().sum()
+        self.lrt = (self._col_prop * np.log(self._col_prop /
+                                            self._null)).sum().sum()
         self.lrt = 2 * self._m
+        self._delta(cell_prop)
+        if self._delta_est.ndim == 1:
+            self._trace = self.delta_est
+            self._trace_sq = np.square(self._delta_est)
+        else:
+            self._trace = np.trace(self._delta_est)
+            self._trace_sq = np.trace(np.square(self._delta_est))
+        self.lrt *= (self._trace / self._trace_sq)
+        dof = np.square(self._trace) / self._trace_sq
 
-    def _stderr(self, cell_prop=True):
+    def _group_variance(self, cell_prop=True):
         # Essentially, we are calculating a total for each level combination
         # between the two variables. Using pandas doesnt allow for the use of
         # summary stats to compute the linearized stderr. Thus, this function
         # gets the indices that make up each 'group', and calculates the stderr
         # however, the indices are a dictionary, so we cant currently match the
         # stderr to the total calculated for each group
-        self.stderr_dict = {}
+        self.var_dict = {}
         for ind in self.df_group.indices.values():
             # make vector of zeros
             group_weights = np.zeros(self._m)
             # except at the indices in a particular group
             group_weights[ind] = self.design.weights[ind]
-            # if cell_prop is true, we calculate the variance of p_rc under the survey design
-            if cell_prop:
-                group_weights[ind] /= self.design.weights.sum()
-            group_design = ss.SurveyDesign(self.design.strat, self.design.clust,
-                                           group_weights)
-            self.stderr_dict[tuple(ind)] = ss.SurveyTotal(group_design, np.ones(self._m),
-                                    cov_method='linearized', center_by='stratum').stderr
+            group_design = ss.SurveyDesign(self.design.strat,
+                                           self.design.clust,
+                                           np.ones(self._m))
 
-    def _delta(self):
-        D_inv = np.linarg.inv(np.diag(st._cell_prop.values))
-        v_hat = np.diag(self._stderr())
-        # need to get off diagonal elements of v_srs. But can't find what
-        # 'p_st' is in the documentation
-        v_srs = np.diag(self._cell_prop * (1 - self._cell_prop) / self._m)
-        dat = pd.DataFrame(self.df.var1.astype('category').cat.codes,
-                           self.df.var2.astype('category').cat.codes)
-        dat = sm.add_constant(dat)
-        dat.columns = ['const', 'var1', 'var2']
-        model_fit = sm.OLS(dat[['const', 'var1']], dat['var2']).fit()
-        # Does not fit the dimensions RCx(R-1)(C-1)
-        # R is the number of rows in the table, C is number of columns
-        model_fit.resid
+            d = np.vstack([group_weights, self.design.weights]).T
+            self.var_dict[tuple(ind)] = np.square(ss.SurveyRatio(group_design,
+                                                  data=d,
+                                                  cov_method='linearized',
+                                                  center_by='stratum').stderr)
+            group_var = np.asarray(list(self.var_dict.values()))
+            group_var = group_var.reshape(len(group_var), )
+            self.group_var = group_var
+        return group_var
+
+    def _delta(self, cell_prop=True):
+        # Constructs 'delta', whose eigenvalues are used for corrections
+        # of the LRT and Pearson statistic
+
+        # Diagonal matrix of the cell proportions
+        D_inv = np.linalg.inv(np.diag(self._cell_prop.values.flatten()))
+
+        # v_hat may or may not be in order bc _group_variance() used dict
+        # indices to grab the observations, and dictionaries aren't ordered
+        v_hat = np.diag(self._group_variance())
+        self.stderr = np.sqrt(v_hat)
+
+        # get v_srs using cell proportions or proportions under the null
+        if cell_prop:
+            v_srs = np.outer(self._col_prop, self._col_prop)
+            np.fill_diagonal(v_srs, self._col_prop * (1-self._col_prop))
+            v_srs /= self._m
+        else:
+            v_srs = np.outer(self._null, self._null) / self._m
+            np.fill_diagonal(v_srs, self._col_prop * (1-self._col_prop))
+            v_srs /= self._m
+
+        # get constrast matrix
+        b = self._contrast_matrix()
+        self.b = b.copy()
+
+        # only making these attributes for testing until result matches STATA
+        self.delta_numer = np.dot(b.T, D_inv).dot(v_hat).dot(D_inv).dot(b)
+        self.delta_denom = np.dot(b.T, D_inv).dot(v_srs).dot(D_inv).dot(b)
+        self.delta_denom = np.linalg.inv(self.delta_denom)
+        self._delta_est = np.dot(self.delta_denom, self.delta_numer)
+
+    def _contrast_matrix(self):
+        # Builds a contrast matrix, full-rank matrix orthogonal to [1|mat]
+        mat = self._main_effects_mat()
+        u, s, vt = np.linalg.svd(mat, 0)
+        b = u[:, s > 1e-12]
+
+        qm = np.eye(b.shape[0]) - np.dot(b, b.T)
+        u, s, vt = np.linalg.svd(qm, 0)
+        b = u[:, s > 1e-12]
+        return b
+
+    def _main_effects_mat(self):
+        # Builds a matrix that contains "main effects" for the rows and columns
+        R, C = self.table.shape
+
+        ir = np.zeros((R, C))
+        ir[0, :] = 1
+        ir = ir.ravel()
+
+        mat = []
+        for i in range(R):
+            mat.append(ir)
+            ir = np.roll(ir, C)
+
+        ic = np.zeros((R, C))
+        ic[:, 0] = 1
+        ic = ic.ravel()
+
+        for i in range(C):
+            mat.append(ic)
+            ic = np.roll(ic, R)
+
+        mat = np.asarray(mat).T
+        return mat
+
+"""
+questions:
+- does STATA round everything at the end? or at the start? bc even the
+uncorrected doesnt match anymore now that I have a large dataset
+- dof don't match
+- matrix may not match?
+
+"""
